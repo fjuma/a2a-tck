@@ -271,16 +271,35 @@ async def test_tasks_resubscribe(async_http_client, agent_card_data):
             ]
         }
     }
-    
-    send_response = sut_client.send_json_rpc("message/send", params=message_params)
-    assert message_utils.is_json_rpc_success_response(send_response)
-    
-    # Extract the task ID from the response
-    task = send_response["result"]
-    assert isinstance(task, dict)
-    assert "id" in task
-    task_id = task["id"]
-    
+
+    req_id = message_utils.generate_request_id()
+    json_rpc_request = message_utils.make_json_rpc_request("message/stream", params=message_params, id=req_id)
+
+    # Send the request and expect a streaming response
+    sut_url = config.get_sut_url()
+    headers = {"Content-Type": "application/json"}
+
+    task_id = None
+
+    async with httpx.AsyncClient() as client:
+        async with client.stream(
+                "POST",
+                sut_url,
+                json=json_rpc_request,
+                headers=headers,
+                timeout=None  # No timeout for streaming
+        ) as response:
+            try:
+                async for chunk in response.aiter_bytes():
+                    # break and close the http client connection after receiving the first event
+                    task_id = extract_task_id_from_chunk(chunk.decode('utf-8'))
+                    break
+            except httpx.ReadError as e:
+                print(f"Read error during streaming: {e}")
+            finally:
+                await response.aclose()
+                print("HTTP client connection closed after first event.")
+
     # Now try to resubscribe to this task
     resubscribe_params = {"id": task_id}
     req_id = message_utils.generate_request_id()
@@ -310,13 +329,14 @@ async def test_tasks_resubscribe(async_http_client, agent_card_data):
                 if "data" in event:
                     try:
                         data = json.loads(event["data"])
+                        print(data)
                         events.append(data)
                         logger.info(f"Received resubscribe SSE event: {data}")
                         
                         # Check if this is a terminal event
                         if "result" in data and isinstance(data["result"], dict):
                             status = data["result"].get("status", {})
-                            if isinstance(status, dict) and status.get("state") in ["completed", "failed", "canceled"]:
+                            if isinstance(status, dict) and status.get("state") in ["completed", "failed", "cancelled"]:
                                 logger.info("Detected terminal event in resubscribe, ending stream processing.")
                                 break
                                 
@@ -331,6 +351,15 @@ async def test_tasks_resubscribe(async_http_client, agent_card_data):
         
         # Validate that we got at least some events
         assert len(events) > 0, "Streaming capability declared but no events received from resubscribe stream"
+
+        for event in events:
+            assert message_utils.is_json_rpc_success_response(event, expected_id=req_id), \
+            "Non-success response received"
+
+
+        # The result should be a Task, Message, TaskStatusUpdateEvent, or TaskArtifactUpdateEvent
+        result = event["result"]
+        assert isinstance(result, dict), "Streaming result must be an object"
         
     except httpx.HTTPError as e:
         if hasattr(e, "response") and e.response.status_code == 501:
@@ -340,6 +369,14 @@ async def test_tasks_resubscribe(async_http_client, agent_card_data):
             )
         else:
             raise
+
+def extract_task_id_from_chunk(chunk):
+    json_string_start = chunk.find("data: ") + len("data: ")
+    json_string_end = chunk.find("\nid: 0\n")
+    json_data_string = chunk[json_string_start:json_string_end].strip()
+    data = json.loads(json_data_string)
+    task_id = data.get("result", {}).get("taskId")
+    return task_id
 
 @optional_capability
 @pytest.mark.asyncio
